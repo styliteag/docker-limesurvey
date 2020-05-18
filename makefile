@@ -8,7 +8,3 @@ fpm-alpine:
 	docker build --pull -t limesurvey:fpm-alpine 3.0/fpm-alpine
 fpm-alpine4:
 	docker build --pull -t limesurvey:fpm-alpine 4.0/fpm-alpine
-fpm:
-	docker build --pull -t limesurvey:fpm 3.0/fpm
-fpm4:
-	docker build --pull -t limesurvey:fpm 4.0/fpm
