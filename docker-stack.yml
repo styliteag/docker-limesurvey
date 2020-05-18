@@ -1,0 +1,98 @@
+version: "3.7"
+
+services:
+  limesurvey:
+    depends_on:
+      - db
+    #image: styliteag/limesurvey:4-fpm
+    image: limesurvey:4-fpm # Local build
+    #build:
+    #  context: 4.0/fpm/
+    #  dockerfile: Dockerfile
+    environment:
+      - DB_HOST=db
+      - DB_PASSWORD=password
+      - DB_TYPE=mysql
+      #- DB_PORT=3306
+      - DB_NAME=limesurvey
+      - DB_USERNAME=limesurvey
+      - ADMIN_USER=limeadmin
+      - ADMIN_NAME=LimeAdmin
+      - ADMIN_EMAIL=office@stylite.de
+      - ADMIN_PASSWORD=password
+      - PUBLIC_URL=lime.2teach.de
+      - DEBUG=2
+      - SQL_DEBUG=0
+    volumes:
+      - ./data/lime_html:/var/www/html
+      #- ./data/upload:/var/www/html/upload
+      #- ./data/surveys:/var/www/html/upload/surveys
+      #- ./data/plugins:/var/www/html/upload/plugins
+    deploy:
+      #placement:
+      #  constraints: [node.hostname==farm02-node01]
+      labels:
+        - com.ouroboros.enable=true
+
+  web:
+    depends_on:
+      - limesurvey
+    #image: nginx:alpine
+    image: styliteag/nginx-docker-swarm:latest  # %%NGINXIMAGE%%
+    #build:
+    #  context: nginx-certbot/
+    #  dockerfile: Dockerfile
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./data/lime_html:/var/www/html
+    environment:
+      - HOSTNAMES=lime.2teach.de
+      - UPSTREAM=tasks.limesurvey
+      - UPSTREAM_PORT=9000
+    networks:
+      - ext
+      - default
+    deploy:
+      labels:
+        - com.ouroboros.enable=true
+        #
+        - traefik.enable=true
+        #
+        # Traefik 2.x Config
+        #
+        - traefik.docker.network=traefik_public
+        # Define my port
+        - traefik.http.services.lime.loadbalancer.server.port=80
+        #
+        # For http Requests
+        #
+        - traefik.http.routers.lime-http.rule=Host(`lime.2teach.de`)
+        - traefik.http.routers.lime-http.entrypoints=web
+        #
+        # Redirect http to https
+        #
+        - traefik.http.routers.lime-http.middlewares=lime-https_redirect
+        - traefik.http.middlewares.lime-https_redirect.redirectscheme.scheme=https
+        - traefik.http.middlewares.lime-https_redirect.redirectscheme.permanent=true
+        #
+        # For https Requests
+        #
+        - traefik.http.routers.lime.entrypoints=websecure
+        - traefik.http.routers.lime.rule=Host(`lime.2teach.de`)
+        - traefik.http.routers.lime.tls=true
+        #- traefik.http.routers.lime.tls.certresolver=acme_http
+
+  db:
+    image: mariadb
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+    environment:
+      - "MYSQL_USER=limesurvey"
+      - "MYSQL_DATABASE=limesurvey"
+      - "MYSQL_PASSWORD=password"
+      - "MYSQL_ROOT_PASSWORD=rootpassword"
+
+networks:
+  ext:
+    external: true
+    name: traefik_public
