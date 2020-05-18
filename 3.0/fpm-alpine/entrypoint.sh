@@ -1,6 +1,63 @@
 #!/bin/bash
 # Entrypoint for Docker Container
 
+echo "Starting....."
+
+# usage: file_env VAR [DEFAULT]
+#    ie: file_env 'XYZ_DB_PASSWORD' 'example'
+# (will allow for "$XYZ_DB_PASSWORD_FILE" to fill in the value of
+#  "$XYZ_DB_PASSWORD" from a file, especially for Docker's secrets feature)
+file_env() {
+	local var="$1"
+	local fileVar="${var}_FILE"
+	local def="${2:-}"
+	if [ "${!var:-}" ] && [ "${!fileVar:-}" ]; then
+		echo >&2 "error: both $var and $fileVar are set (but are exclusive)"
+		exit 1
+	fi
+	local val="$def"
+	if [ "${!var:-}" ]; then
+		val="${!var}"
+	elif [ "${!fileVar:-}" ]; then
+		val="$(< "${!fileVar}")"
+	fi
+	export "$var"="$val"
+	unset "$fileVar"
+}
+
+# see http://stackoverflow.com/a/2705678/433558
+sed_escape_lhs() {
+    echo "$@" | sed -e 's/[]\/$*.^|[]/\\&/g'
+}
+sed_escape_rhs() {
+    echo "$@" | sed -e 's/[\/&]/\\&/g'
+}
+php_escape() {
+    php -r 'var_export(('$2') $argv[1]);' -- "$1"
+}
+set_config() {
+    key="$1"
+    value="$2"
+    sed -i "/'$key'/s/>\(.*\)/>$value,/1"  application/config/config.php
+}
+
+# version_greater A B returns whether A > B
+version_greater() {
+    [ "$(printf '%s\n' "$@" | sort -t '.' -n -k1,1 -k2,2 -k3,3 -k4,4 | head -n 1)" != "$1" ]
+}
+
+# return true if specified directory is empty
+directory_empty() {
+    [ -z "$(ls -A "$1/")" ]
+}
+
+run_as() {
+    if [ "$(id -u)" = 0 ]; then
+        su -p www-data -s /bin/sh -c "$1"
+    else
+        sh -c "$1"
+    fi
+}
 
 DB_TYPE=${DB_TYPE:-'mysql'}
 DB_HOST=${DB_HOST:-'mysql'}
@@ -8,16 +65,64 @@ DB_PORT=${DB_PORT:-'3306'}
 DB_SOCK=${DB_SOCK:-}
 DB_NAME=${DB_NAME:-'limesurvey'}
 DB_TABLE_PREFIX=${DB_TABLE_PREFIX:-'lime_'}
+USE_INNODB=${USE_INNODB:-}
+MYSQL_SSL_CA=${MYSQL_SSL_CA:-}
 DB_USERNAME=${DB_USERNAME:-'limesurvey'}
-DB_PASSWORD=${DB_PASSWORD:-}
+# DB_PASSWORD=${DB_PASSWORD:-}
+file_env 'DB_PASSWORD' ''
 
 ADMIN_USER=${ADMIN_USER:-'admin'}
 ADMIN_NAME=${ADMIN_NAME:-'admin'}
 ADMIN_EMAIL=${ADMIN_EMAIL:-'foobar@example.com'}
-ADMIN_PASSWORD=${ADMIN_PASSWORD:-'-'}
+#ADMIN_PASSWORD=${ADMIN_PASSWORD:-'-'}
+file_env 'ADMIN_PASSWORD' ''
 
 PUBLIC_URL=${PUBLIC_URL:-}
 URL_FORMAT=${URL_FORMAT:-'path'}
+
+DEBUG=${DEBUG:-'0'}
+SQL_DEBUG=${SQ_DEBUG:-'0'}
+
+installed_version="0.0.0"
+
+ if [ -f /var/www/html/application/config/version.php ]; then
+    # shellcheck disable=SC2016
+    installed_version="$(php -r 'require "/var/www/html/application/config/version.php"; echo $config["versionnumber"];' 2>/dev/null )"
+fi
+# shellcheck disable=SC2016
+image_version="$(php -r 'require "/var/www/html-src/application/config/version.php"; echo $config["versionnumber"];' 2>/dev/null )"
+
+echo "installed_version: $installed_version"
+echo "image_version    : $image_version"
+
+if version_greater "$installed_version" "$image_version"; then
+    echo "Can't start limesurvey because the version of the data ($installed_version) is higher than the docker image version ($image_version) and downgrading is not supported. Are you sure you have pulled the newest image version?"
+    exit 1
+fi
+
+if version_greater "$image_version" "$installed_version"; then
+    echo "Initializing limesurvey $image_version ..."
+    if [ "$installed_version" != "0.0.0.0" ]; then
+        echo "Upgrading limesurvey from $installed_version ..."
+        #run_as 'php /var/www/html/occ app:list' | sed -n "/Enabled:/,/Disabled:/p" > /tmp/list_before
+    fi
+    if [ "$(id -u)" = 0 ]; then
+        rsync_options="-rlDog --chown www-data:root"
+    else
+        rsync_options="-rlD"
+    fi
+    rsync $rsync_options --delete --exclude-from=/upgrade.exclude /var/www/html-src/ /var/www/html/
+
+    for dir in upload/surveys upload/plugins; do
+        # Copy only if they dont exist in the dest
+        if [ ! -d "/var/www/html/$dir" ] || directory_empty "/var/www/html/$dir"; then
+            rsync $rsync_options --include "/$dir/" --exclude '/*' /var/www/html-src/ /var/www/html/
+        fi
+    done
+    #rsync $rsync_options --include 'application/config/version.php' --exclude '/*' /var/www/html-src/ /var/www/html/
+    cp /var/www/html-src/application/config/version.php /var/www/html-src/application/config/version.php
+    echo "Initializing finished"
+fi
 
 
 # Check if database is available
@@ -33,7 +138,10 @@ fi
 # Check if already provisioned
 if [ -f application/config/config.php ]; then
     echo 'Info: config.php already provisioned'
-else
+    cp application/config/config.php application/config/config.php.old 
+    echo 'Continue...'
+fi
+#else
     echo 'Info: Generating config.php'
 
     if [ "$DB_TYPE" = 'mysql' ]; then
@@ -49,29 +157,61 @@ else
     fi
 
     # Set Database config
-    if [ ! -z "$DB_SOCK" ]; then
-        echo 'Info: Using unix socket'
-        sed -i "s#\('connectionString' => \).*,\$#\\1'${DB_TYPE}:unix_socket=${DB_SOCK};dbname=${DB_NAME};',#g" application/config/config.php
-    else
-        echo 'Info: Using TCP connection'
-        sed -i "s#\('connectionString' => \).*,\$#\\1'${DB_TYPE}:host=${DB_HOST};port=${DB_PORT};dbname=${DB_NAME};',#g" application/config/config.php
-    fi
+#    if [ ! -z "$DB_SOCK" ]; then
+#        echo 'Info: Using unix socket'
+#        sed -i "s#\('connectionString' => \).*,\$#\\1'${DB_TYPE}:unix_socket=${DB_SOCK};dbname=${DB_NAME};',#g" application/config/config.php
+#    else
+#        echo 'Info: Using TCP connection'
+#        sed -i "s#\('connectionString' => \).*,\$#\\1'${DB_TYPE}:host=${DB_HOST};port=${DB_PORT};dbname=${DB_NAME};',#g" application/config/config.php
+#    fi
 
-    sed -i "s#\('username' => \).*,\$#\\1'${DB_USERNAME}',#g" application/config/config.php
-    sed -i "s#\('password' => \).*,\$#\\1'${DB_PASSWORD}',#g" application/config/config.php
-    sed -i "s#\('charset' => \).*,\$#\\1'${DB_CHARSET}',#g" application/config/config.php
-    sed -i "s#\('tablePrefix' => \).*,\$#\\1'${DB_TABLE_PREFIX}',#g" application/config/config.php
+ 
+#    sed -i "s#\('tablePrefix' => \).*,\$#\\1'${DB_TABLE_PREFIX}',#g" application/config/config.php
 
     # Set URL config
-    sed -i "s#\('urlFormat' => \).*,\$#\\1'${URL_FORMAT}',#g" application/config/config.php
+ #   sed -i "s#\('urlFormat' => \).*,\$#\\1'${URL_FORMAT}',#g" application/config/config.php
 
     # Set Public URL
-    if [ -z "$PUBLIC_URL" ]; then
-        echo 'Info: Setting PublicURL'
-        sed -i "s#\('debug'=>0,\)\$#'publicurl'=>'${PUBLIC_URL}',\n\t\t\\1 #g" application/config/config.php
-    fi
+#    if [ -z "$PUBLIC_URL" ]; then
+#        echo 'Info: Setting PublicURL'
+#        sed -i "s#\('debug'=>0,\)\$#'publicurl'=>'${PUBLIC_URL}',\n\t\t\\1 #g" application/config/config.php
+#    fi
+#fi
+
+
+set_config 'connectionString' "'mysql:host=$DB_HOST;port=$DB_PORT;dbname=$DB_NAME;'"
+set_config 'tablePrefix'      "'$DB_TABLE_PREFIX'"
+set_config 'username'         "'$DB_USERNAME'"
+set_config 'password'         "'$DB_PASSWORD'"
+#set_config 'publicurl'        "$PUBLIC_URL"
+set_config 'urlFormat'        "'$URL_FORMAT'"
+set_config 'charset'          "'$DB_CHARSET'"
+set_config 'debug'            "$DEBUG"
+set_config 'debugsql'         "$SQL_DEBUG"
+
+if [ -n "$MYSQL_SSL_CA" ]; then
+	set_config 'attributes' "array(PDO::MYSQL_ATTR_SSL_CA => '\/var\/www\/html\/$MYSQL_SSL_CA', PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT => false)"
 fi
 
+if [ -n "$USE_INNODB" ]; then
+    #If you want to use INNODB - remove MyISAM specification from LimeSurvey code
+    sed -i "/ENGINE=MyISAM/s/\(ENGINE=MyISAM \)//1" application/core/db/MysqlSchema.php
+    #Also set mysqlEngine in config file
+    sed -i "/\/\/ Update default LimeSurvey config here/s//'mysqlEngine'=>'InnoDB',/" application/config/config.php
+    DBENGINE='InnoDB'
+fi
+
+chown www-data:www-data -R tmp
+mkdir -p upload/surveys
+mkdir -p upload/plugins
+chown www-data:www-data -R upload
+chown www-data:www-data -R application/config
+
+# DBSTATUS=$(TERM=dumb php -- "$LIMESURVEY_DB_HOST" "$LIMESURVEY_DB_USER" "$LIMESURVEY_DB_PASSWORD" "$LIMESURVEY_DB_NAME" "$LIMESURVEY_TABLE_PREFIX" "$MYSQL_SSL_CA" <<'EOPHP'
+
+#echo "========= application/config/config.php ========="
+#cat application/config/config.php
+#echo "================================================="
 
 # Check if LimeSurvey database is provisioned
 echo 'Info: Check if database already provisioned. Nevermind the Stack trace.'
@@ -95,7 +235,12 @@ else
 
     echo ''
     echo 'Running console.php install'
-    php application/commands/console.php install $ADMIN_USER $ADMIN_PASSWORD $ADMIN_NAME $ADMIN_EMAIL
+    php application/commands/console.php install $ADMIN_USER $ADMIN_PASSWORD $ADMIN_NAME $ADMIN_EMAIL verbose
+fi
+
+if [ -n "$ADMIN_USER" ] && [ -n "$ADMIN_PASSWORD" ]; then
+    echo >&2 'Updating password for admin user'
+    php application/commands/console.php resetpassword "$ADMIN_USER" "$ADMIN_PASSWORD"
 fi
 
 exec "$@"
